@@ -29,12 +29,12 @@ LOCAL_TZ = ZoneInfo("America/Los_Angeles")
 POLL_FR24_SECONDS = 3600
 POLL_FA_SECONDS = 180
 STATUS_UPDATE_SECONDS = 120
-AUTO_DELETE_SECONDS = 1800  # 30 minutes
+AUTO_DELETE_SECONDS = 1800
 
 UA = "Mozilla/5.0"
 
 # =============================
-# Discord setup
+# Discord
 # =============================
 intents = discord.Intents.default()
 bot = commands.Bot(command_prefix="!", intents=intents)
@@ -61,6 +61,13 @@ CREATE TABLE IF NOT EXISTS tracked_flights (
     channel_id INTEGER,
     flight_no TEXT,
     flight_date TEXT,
+    origin TEXT,
+    dest TEXT,
+    sched_dep TEXT,
+    sched_arr TEXT,
+    airline TEXT,
+    aircraft TEXT,
+    seat TEXT,
     notified_off INTEGER DEFAULT 0,
     notified_on INTEGER DEFAULT 0
 )
@@ -103,27 +110,43 @@ async def delete_after(msg):
         pass
 
 # =============================
-# FR24 Parsing
+# FR24 Parsing (FULL DATA)
 # =============================
 DATE_RE = re.compile(r"\d{4}-\d{2}-\d{2}")
-FLIGHT_RE = re.compile(r"[A-Z]{2,4}\d+")
 
 def parse_fr24(html):
     soup = BeautifulSoup(html, "html.parser")
     flights = []
+
     for tr in soup.select("tr"):
         tds = [td.get_text(strip=True) for td in tr.select("td")]
-        if len(tds) >= 2 and DATE_RE.match(tds[0]) and FLIGHT_RE.match(tds[1]):
-            flights.append((tds[0], tds[1]))
+        if len(tds) < 10 or not DATE_RE.match(tds[0]):
+            continue
+
+        flights.append({
+            "date": tds[0],
+            "flight": tds[1],
+            "origin": tds[3],
+            "dest": tds[4],
+            "sched_dep": tds[6],
+            "sched_arr": tds[7],
+            "airline": tds[8],
+            "aircraft": tds[9],
+            "seat": tds[10] if len(tds) > 10 else None,
+        })
+
     return flights
 
 # =============================
-# FlightAware lookup
+# FlightAware (STRICT DATE MATCH)
 # =============================
-def get_fa_instance(flight_no, flight_date):
-    d = datetime.fromisoformat(flight_date).replace(tzinfo=LOCAL_TZ)
-    start = (d - timedelta(days=1)).astimezone(ZoneInfo("UTC")).isoformat()
-    end = (d + timedelta(days=2)).astimezone(ZoneInfo("UTC")).isoformat()
+def get_fa_instance(flight_no, fr24_date):
+    target_date = datetime.fromisoformat(fr24_date).date()
+    now = datetime.now(tz=LOCAL_TZ)
+
+    d = datetime.fromisoformat(fr24_date).replace(tzinfo=LOCAL_TZ)
+    start = (d - timedelta(hours=12)).astimezone(ZoneInfo("UTC")).isoformat()
+    end = (d + timedelta(hours=36)).astimezone(ZoneInfo("UTC")).isoformat()
 
     r = requests.get(
         f"{FA_BASE}/flights/{flight_no}",
@@ -135,42 +158,85 @@ def get_fa_instance(flight_no, flight_date):
         return None
 
     flights = r.json().get("flights", [])
+    candidates = []
+
     for f in flights:
+        if f.get("actual_on"):
+            continue
+
         off = parse_iso(f.get("scheduled_off")) or parse_iso(f.get("estimated_off"))
-        if off and localize(off).date() == d.date():
-            return f
-    return flights[0] if flights else None
+        if not off:
+            continue
+
+        off_local = off.astimezone(LOCAL_TZ)
+
+        if off_local.date() != target_date:
+            continue
+
+        if (off_local - now).total_seconds() < -3600:
+            continue
+
+        candidates.append((off_local, f))
+
+    if not candidates:
+        return None
+
+    candidates.sort(key=lambda x: x[0])
+    return candidates[0][1]
 
 # =============================
 # Embeds
 # =============================
-def status_embed(info):
-    e = discord.Embed(title="🧭 Hana’s Next Flight", color=discord.Color.blurple())
-    if not info:
-        e.description = "No upcoming flights detected."
-        return e
+def status_embed(fr, fa):
+    e = discord.Embed(
+        title="🧭 Hana’s Next Flight",
+        color=discord.Color.blurple()
+    )
 
-    e.description = f"**{info['flight']} — {info['origin']} → {info['dest']}**"
-    e.add_field(name="Departs in", value=countdown(info["off"]), inline=True)
-    e.add_field(name="Scheduled", value=fmt(info["off"]), inline=True)
-    e.add_field(name="Status", value=info["status"], inline=False)
-    if info.get("aircraft"):
-        e.add_field(name="Aircraft", value=info["aircraft"], inline=True)
+    e.description = f"**{fr['flight']} — {fr['origin']} → {fr['dest']}**"
+
+    e.add_field(
+        name="Scheduled",
+        value=f"{fr['date']} · {fr['sched_dep']} → {fr['sched_arr']}",
+        inline=False
+    )
+
+    e.add_field(name="Aircraft", value=fr["aircraft"], inline=True)
+    e.add_field(name="Airline", value=fr["airline"], inline=True)
+
+    if fr.get("seat"):
+        e.add_field(name="Seat", value=fr["seat"], inline=True)
+
+    if fa:
+        off = parse_iso(fa.get("scheduled_off")) or parse_iso(fa.get("estimated_off"))
+        e.add_field(name="Departs in", value=countdown(off), inline=True)
+        e.add_field(name="Status", value=fa.get("status", "Scheduled"), inline=True)
+        if fa.get("fa_flight_id"):
+            e.add_field(
+                name="Live map",
+                value=f"[Open on FlightAware](https://flightaware.com/live/flight/id/{fa['fa_flight_id']})",
+                inline=False
+            )
+    else:
+        e.add_field(name="Status", value="Waiting for FlightAware data", inline=False)
+
+    e.set_footer(text="This message updates automatically.")
     return e
 
-def takeoff_embed(info):
-    e = discord.Embed(title="🛫 Takeoff", description=f"**{info['flight']}**", color=discord.Color.green())
-    e.add_field(name="Route", value=f"{info['origin']} → {info['dest']}", inline=False)
-    e.add_field(name="Off", value=fmt(info["off"]), inline=True)
+def takeoff_embed(fr, fa):
+    e = discord.Embed(title="🛫 Takeoff", color=discord.Color.green())
+    e.description = f"**{fr['flight']} — {fr['origin']} → {fr['dest']}**"
+    e.add_field(name="Off", value=fmt(parse_iso(fa.get("actual_off"))), inline=True)
     return e
 
-def landed_embed(info):
-    e = discord.Embed(title="🛬 Landed", description=f"**{info['flight']}**", color=discord.Color.orange())
-    e.add_field(name="On", value=fmt(info["on"]), inline=True)
+def landed_embed(fr, fa):
+    e = discord.Embed(title="🛬 Landed", color=discord.Color.orange())
+    e.description = f"**{fr['flight']} — {fr['origin']} → {fr['dest']}**"
+    e.add_field(name="On", value=fmt(parse_iso(fa.get("actual_on"))), inline=True)
     return e
 
 # =============================
-# Slash commands
+# Slash Commands
 # =============================
 @bot.tree.command(name="set_autopost")
 async def set_autopost(interaction: discord.Interaction):
@@ -184,7 +250,7 @@ async def set_autopost(interaction: discord.Interaction):
 
 @bot.tree.command(name="set_status_message")
 async def set_status(interaction: discord.Interaction):
-    msg = await interaction.channel.send(embed=status_embed(None))
+    msg = await interaction.channel.send("Initializing…")
     cur.execute("""
         INSERT INTO guild_settings (guild_id, status_channel, status_message)
         VALUES (?, ?, ?)
@@ -196,7 +262,7 @@ async def set_status(interaction: discord.Interaction):
     await interaction.response.send_message("✅ Status message created.", ephemeral=True)
 
 # =============================
-# Background tasks
+# Background Tasks
 # =============================
 async def fr24_import_loop():
     while True:
@@ -204,73 +270,53 @@ async def fr24_import_loop():
         flights = parse_fr24(r.text) if r.status_code == 200 else []
 
         today = date.today().isoformat()
-        future = [(d, f) for d, f in flights if d >= today]
 
         cur.execute("SELECT guild_id, autopost_channel FROM guild_settings")
-        for guild_id, channel_id in cur.fetchall():
+        for gid, channel_id in cur.fetchall():
             if not channel_id:
                 continue
-            for d, f in future:
+            for f in flights:
+                if f["date"] < today:
+                    continue
                 cur.execute("""
                     INSERT OR IGNORE INTO tracked_flights
-                    (guild_id, channel_id, flight_no, flight_date)
-                    VALUES (?, ?, ?, ?)
-                """, (guild_id, channel_id, f, d))
+                    (guild_id, channel_id, flight_no, flight_date, origin, dest,
+                     sched_dep, sched_arr, airline, aircraft, seat)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    gid, channel_id,
+                    f["flight"], f["date"], f["origin"], f["dest"],
+                    f["sched_dep"], f["sched_arr"],
+                    f["airline"], f["aircraft"], f["seat"]
+                ))
                 db.commit()
+
         await asyncio.sleep(POLL_FR24_SECONDS)
-
-async def flight_poll_loop():
-    while True:
-        cur.execute("SELECT * FROM tracked_flights")
-        for row in cur.fetchall():
-            row_id, guild_id, channel_id, flight, fdate, off_sent, on_sent = row
-            guild = bot.get_guild(guild_id)
-            if not guild:
-                continue
-            channel = guild.get_channel(channel_id)
-            if not channel:
-                continue
-
-            inst = get_fa_instance(flight, fdate)
-            if not inst:
-                continue
-
-            off = parse_iso(inst.get("actual_off"))
-            on = parse_iso(inst.get("actual_on"))
-
-            info = {
-                "flight": flight,
-                "origin": inst["origin"]["code_iata"],
-                "dest": inst["destination"]["code_iata"],
-                "off": off,
-                "on": on,
-                "status": inst.get("status"),
-                "aircraft": inst.get("aircraft_type")
-            }
-
-            if off and not off_sent:
-                msg = await channel.send(embed=takeoff_embed(info))
-                bot.loop.create_task(delete_after(msg))
-                cur.execute("UPDATE tracked_flights SET notified_off=1 WHERE id=?", (row_id,))
-                db.commit()
-
-            if on and not on_sent:
-                msg = await channel.send(embed=landed_embed(info))
-                bot.loop.create_task(delete_after(msg))
-                cur.execute("DELETE FROM tracked_flights WHERE id=?", (row_id,))
-                db.commit()
-
-        await asyncio.sleep(POLL_FA_SECONDS)
 
 async def status_update_loop():
     while True:
-        r = requests.get(FR24_URL, headers={"User-Agent": UA})
-        flights = parse_fr24(r.text) if r.status_code == 200 else []
+        cur.execute("SELECT * FROM tracked_flights ORDER BY flight_date ASC LIMIT 1")
+        row = cur.fetchone()
 
         cur.execute("SELECT guild_id, status_channel, status_message FROM guild_settings")
         for gid, ch_id, msg_id in cur.fetchall():
-            if not ch_id or not msg_id:
+            if not row or not ch_id or not msg_id:
                 continue
+
+            fr = {
+                "flight": row[3],
+                "date": row[4],
+                "origin": row[5],
+                "dest": row[6],
+                "sched_dep": row[7],
+                "sched_arr": row[8],
+                "airline": row[9],
+                "aircraft": row[10],
+                "seat": row[11],
+            }
+
+            fa = get_fa_instance(fr["flight"], fr["date"])
+
             guild = bot.get_guild(gid)
             if not guild:
                 continue
@@ -278,23 +324,9 @@ async def status_update_loop():
             if not channel:
                 continue
 
-            next_info = None
-            for d, f in flights:
-                inst = get_fa_instance(f, d)
-                if inst:
-                    next_info = {
-                        "flight": f,
-                        "origin": inst["origin"]["code_iata"],
-                        "dest": inst["destination"]["code_iata"],
-                        "off": parse_iso(inst.get("scheduled_off")),
-                        "status": inst.get("status"),
-                        "aircraft": inst.get("aircraft_type")
-                    }
-                    break
-
             try:
                 msg = await channel.fetch_message(msg_id)
-                await msg.edit(embed=status_embed(next_info))
+                await msg.edit(embed=status_embed(fr, fa))
             except:
                 pass
 
@@ -308,7 +340,6 @@ async def on_ready():
     await bot.tree.sync()
     print(f"Logged in as {bot.user}")
     bot.loop.create_task(fr24_import_loop())
-    bot.loop.create_task(flight_poll_loop())
     bot.loop.create_task(status_update_loop())
 
 bot.run(DISCORD_TOKEN)
