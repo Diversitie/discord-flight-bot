@@ -250,7 +250,12 @@ async def set_autopost(interaction: discord.Interaction):
 
 @bot.tree.command(name="set_status_message")
 async def set_status(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+
+    # Create placeholder message
     msg = await interaction.channel.send("Initializing…")
+
+    # Save message location
     cur.execute("""
         INSERT INTO guild_settings (guild_id, status_channel, status_message)
         VALUES (?, ?, ?)
@@ -259,7 +264,33 @@ async def set_status(interaction: discord.Interaction):
         status_message=excluded.status_message
     """, (interaction.guild_id, interaction.channel_id, msg.id))
     db.commit()
-    await interaction.response.send_message("✅ Status message created.", ephemeral=True)
+
+    # 🔥 IMMEDIATE REFRESH 🔥
+    try:
+        r = requests.get(FR24_URL, headers={"User-Agent": UA}, timeout=20)
+        flights = parse_fr24(r.text) if r.status_code == 200 else []
+
+        today = date.today().isoformat()
+        next_fr = None
+
+        for f in flights:
+            if f["date"] >= today:
+                next_fr = f
+                break
+
+        if next_fr:
+            fa = get_fa_instance(next_fr["flight"], next_fr["date"])
+            await msg.edit(embed=status_embed(next_fr, fa))
+        else:
+            await msg.edit(embed=status_embed(None, None))
+
+        await interaction.followup.send("✅ Status message created and refreshed instantly.", ephemeral=True)
+
+    except Exception as e:
+        await interaction.followup.send(
+            f"⚠️ Status message created, but refresh failed:\n`{e}`",
+            ephemeral=True
+        )
 
 # =============================
 # Background Tasks
@@ -343,3 +374,4 @@ async def on_ready():
     bot.loop.create_task(status_update_loop())
 
 bot.run(DISCORD_TOKEN)
+
